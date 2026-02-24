@@ -87,7 +87,7 @@ ReviewGPT/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/ReviewGPT.git
+git clone https://github.com/myriam-sys/ReviewGPT.git
 cd ReviewGPT
 ```
 
