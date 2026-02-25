@@ -26,6 +26,9 @@ class Settings(BaseSettings):
 
     # ── Supabase ──────────────────────────────────────────────────────────────
     supabase_url: str = ""
+    # Key passed to supabase.create_client() for server-side SDK operations.
+    # Set to your service_role key so DB writes bypass RLS.
+    supabase_key: str = ""
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
     supabase_db_url: str = ""

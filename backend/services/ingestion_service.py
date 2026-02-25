@@ -34,6 +34,7 @@ from dateutil.relativedelta import relativedelta  # transitive dep via dateparse
 from langdetect import detect, LangDetectException
 from pydantic import ValidationError
 
+from backend.db.supabase_client import get_client
 from backend.models.schemas import ReviewClean, RowError
 
 logger = logging.getLogger(__name__)
@@ -453,6 +454,78 @@ def validate_and_clean(
         len(errors),
     )
     return valid_reviews, errors
+
+
+def save_reviews_to_db(reviews: list[ReviewClean], session_id: str) -> int:
+    """
+    Insert *reviews* into the Supabase ``reviews`` table in batches.
+
+    Rows are serialised to plain dicts before insertion — UUIDs become strings
+    and datetimes become ISO 8601 strings — because the Supabase PostgREST
+    layer expects JSON-compatible values.
+
+    The ``embedding`` column is intentionally omitted here; it will be
+    populated by the embedding service in Phase 3.
+
+    Parameters
+    ----------
+    reviews:
+        Validated review records produced by ``validate_and_clean``.
+    session_id:
+        The upload session UUID (already present on each record; passed
+        separately as a convenience for logging).
+
+    Returns
+    -------
+    int
+        The total number of rows confirmed inserted by Supabase.  This may
+        differ from ``len(reviews)`` if Supabase returns partial data.
+
+    Raises
+    ------
+    RuntimeError
+        When Supabase credentials are not configured (propagated from
+        ``get_client``).
+    Exception
+        Any network or PostgREST error is re-raised so the caller can decide
+        whether to fall back to in-memory storage.
+    """
+    if not reviews:
+        return 0
+
+    rows = [
+        {
+            "review_id": str(r.review_id),
+            "session_id": session_id,
+            "author": r.author,
+            "rating": r.rating,
+            "date": r.date.isoformat() if r.date else None,
+            "text": r.text,
+            "language": r.language,
+            "has_text": r.has_text,
+        }
+        for r in reviews
+    ]
+
+    _BATCH_SIZE = 500  # stay well within PostgREST's default payload limit
+    inserted = 0
+    client = get_client()
+
+    for batch_start in range(0, len(rows), _BATCH_SIZE):
+        batch = rows[batch_start : batch_start + _BATCH_SIZE]
+        result = client.table("reviews").insert(batch).execute()
+        inserted += len(result.data)
+        logger.debug(
+            "Inserted batch — session=%s rows=%d cumulative=%d",
+            session_id,
+            len(result.data),
+            inserted,
+        )
+
+    logger.info(
+        "DB insert complete — session=%s total_inserted=%d", session_id, inserted
+    )
+    return inserted
 
 
 def detect_language(text: str) -> str:

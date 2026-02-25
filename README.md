@@ -66,7 +66,9 @@ ReviewGPT/
 │   │   └── schemas.py            # Pydantic request/response models
 │   ├── db/
 │   │   ├── __init__.py
-│   │   └── supabase_client.py    # Supabase client initialization
+│   │   ├── supabase_client.py    # Supabase SDK + asyncpg pool singletons
+│   │   └── migrations/
+│   │       └── 001_create_reviews.sql  # reviews table + pgvector indexes
 │   └── core/
 │       ├── __init__.py
 │       └── config.py             # Env var loading via pydantic-settings
@@ -121,13 +123,27 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 The API will be available at `http://localhost:8000`.
 Interactive docs at `http://localhost:8000/docs`.
 
-### 6. Enable pgvector in Supabase
+### 6. Run the database migration
 
-Run the following SQL in your Supabase SQL editor:
+Open the [Supabase SQL editor](https://supabase.com/dashboard/project/_/sql) for your project and run the contents of [backend/db/migrations/001_create_reviews.sql](backend/db/migrations/001_create_reviews.sql).
+
+This migration:
+- Enables the `vector` extension (pgvector)
+- Creates the `reviews` table with all required columns, including a `vector(1024)` column for embeddings (populated in Phase 3)
+- Creates indexes on `session_id` and `has_text` for fast lookups
+- Enables Row-Level Security so the anon key cannot read rows directly
 
 ```sql
-create extension if not exists vector;
+-- Quick reference — run the full file, not just this snippet:
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS reviews (
+    review_id  UUID PRIMARY KEY,
+    session_id UUID NOT NULL,
+    ...
+);
 ```
+
+The migration is idempotent (`CREATE … IF NOT EXISTS`) and safe to run more than once.
 
 ## Deployment
 

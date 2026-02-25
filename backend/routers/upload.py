@@ -28,7 +28,11 @@ from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from backend.core.config import settings
 from backend.models.schemas import PreviewResponse, ReviewClean, UploadResponse
-from backend.services.ingestion_service import parse_file, validate_and_clean
+from backend.services.ingestion_service import (
+    parse_file,
+    save_reviews_to_db,
+    validate_and_clean,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,18 +147,35 @@ async def upload_csv(
             detail="An unexpected error occurred while validating the CSV.",
         ) from exc
 
-    # Persist in the in-memory store for the preview endpoint.
+    # Always persist in the in-memory store so the preview endpoint works
+    # regardless of whether the DB write succeeds.
     _session_store[session_id] = valid_reviews
 
     reviews_with_text = sum(1 for r in valid_reviews if r.has_text)
 
+    # ── Persist to Supabase ───────────────────────────────────────────────────
+    # The DB write is best-effort: if credentials are absent or the insert
+    # fails for any reason we log the error and continue.  The in-memory store
+    # guarantees the preview endpoint still works for the session lifetime.
+    inserted_rows = 0
+    try:
+        inserted_rows = save_reviews_to_db(valid_reviews, session_id)
+    except Exception:
+        logger.exception(
+            "DB write failed — session=%s reviews will only be available "
+            "in-memory for this session.",
+            session_id,
+        )
+
     logger.info(
-        "Ingestion complete — session=%s total=%d valid=%d invalid=%d embeddable=%d",
+        "Ingestion complete — session=%s total=%d valid=%d invalid=%d "
+        "embeddable=%d inserted=%d",
         session_id,
         total_rows,
         len(valid_reviews),
         len(errors),
         reviews_with_text,
+        inserted_rows,
     )
 
     return UploadResponse(
@@ -163,6 +184,7 @@ async def upload_csv(
         valid_rows=len(valid_reviews),
         invalid_rows=len(errors),
         reviews_with_text=reviews_with_text,
+        inserted_rows=inserted_rows,
         errors=errors,
     )
 
