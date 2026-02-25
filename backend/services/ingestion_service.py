@@ -20,6 +20,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+import dateparser
 import pandas as pd
 from langdetect import detect, LangDetectException
 from pydantic import ValidationError
@@ -93,11 +94,17 @@ def parse_csv(file_bytes: bytes) -> pd.DataFrame:
     """
     Decode *file_bytes* and parse them into a ``DataFrame``.
 
-    Encoding detection strategy
-    ---------------------------
+    Encoding and separator detection strategy
+    -----------------------------------------
     1. Attempt UTF-8 (covers the vast majority of modern exports).
     2. Fall back to Latin-1 / ISO-8859-1, which handles most Western-European
        Google Maps exports that include accented characters.
+
+    For each encoding, ``sep=None, engine='python'`` is passed to
+    ``pd.read_csv`` so that Python's built-in CSV sniffer automatically
+    detects the delimiter (comma, semicolon, tab, pipe, etc.).  This covers
+    the common case of French/European exports that use ``;`` as the
+    separator.
 
     Parameters
     ----------
@@ -118,8 +125,19 @@ def parse_csv(file_bytes: bytes) -> pd.DataFrame:
     for encoding in ("utf-8", "latin-1"):
         try:
             text = file_bytes.decode(encoding)
-            df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
-            logger.debug("CSV parsed with encoding=%s, shape=%s", encoding, df.shape)
+            df = pd.read_csv(
+                io.StringIO(text),
+                sep=None,           # let pandas sniff the delimiter
+                engine="python",    # required when sep=None
+                dtype=str,
+                keep_default_na=False,
+            )
+            logger.debug(
+                "CSV parsed — encoding=%s columns=%s shape=%s",
+                encoding,
+                df.columns.tolist(),
+                df.shape,
+            )
             return df
         except UnicodeDecodeError:
             continue
@@ -240,11 +258,9 @@ def validate_and_clean(
             language_from_csv = detect_language(text_value)
             language_detected = True
 
-        try:
-            date_value = _parse_date(_get("date"))
-        except ValueError as exc:
-            errors.append(RowError(row=row_number, reason=str(exc)))
-            continue
+        date_value = _parse_date(_get("date"))
+        # date_value is None when the field is missing or unparseable;
+        # the row is still ingested (ReviewClean.date allows None).
 
         try:
             review = ReviewClean(
@@ -307,9 +323,19 @@ def detect_language(text: str) -> str:
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 
-def _parse_date(raw: str | None) -> datetime:
+def _parse_date(raw: str | None) -> datetime | None:
     """
-    Attempt to parse *raw* into a ``datetime`` using a set of common formats.
+    Attempt to parse *raw* into a ``datetime``.
+
+    Parsing strategy (in order)
+    ---------------------------
+    1. Explicit ``strptime`` formats — fast, unambiguous, covers well-formed
+       absolute dates in the 10 most common CSV export styles.
+    2. ``dateparser.parse`` — handles relative strings in multiple languages,
+       e.g. ``"il y a 2 ans"``, ``"Modifié il y a 3 mois"``,
+       ``"2 weeks ago"``, ``"X years ago"``.  ``PREFER_DAY_OF_MONTH`` and
+       ``RETURN_AS_TIMEZONE_AWARE=False`` keep the output consistent with the
+       strptime path.
 
     Parameters
     ----------
@@ -318,18 +344,18 @@ def _parse_date(raw: str | None) -> datetime:
 
     Returns
     -------
-    datetime
-        Parsed datetime object.
-
-    Raises
-    ------
-    ValueError
-        When *raw* is ``None``, empty, or does not match any known format.
+    datetime | None
+        Parsed datetime object, or ``None`` when *raw* is missing/empty or
+        cannot be parsed by either strategy.  A warning is logged in the
+        latter case so the issue is visible without rejecting the row.
     """
     if not raw:
-        raise ValueError("Date field is missing or empty.")
+        logger.warning("Date field is missing or empty — storing None.")
+        return None
 
-    # Ordered from most specific to least specific.
+    # ── Stage 1: explicit strptime formats ────────────────────────────────────
+    # Ordered from most specific to least specific to avoid ambiguous matches
+    # (e.g. %d/%m/%Y must come before %m/%d/%Y).
     formats = [
         "%Y-%m-%dT%H:%M:%S",   # ISO 8601 with time
         "%Y-%m-%dT%H:%M:%SZ",  # ISO 8601 UTC
@@ -349,7 +375,21 @@ def _parse_date(raw: str | None) -> datetime:
         except ValueError:
             continue
 
-    raise ValueError(
-        f"Could not parse date {raw!r}. "
-        "Expected formats include YYYY-MM-DD, DD/MM/YYYY, or ISO 8601."
+    # ── Stage 2: dateparser — relative & multilingual strings ─────────────────
+    # Handles: "il y a 2 ans", "Modifié il y a 3 mois", "il y a un an",
+    #          "il y a 2 semaines", "2 years ago", "3 months ago", etc.
+    parsed = dateparser.parse(
+        raw,
+        settings={
+            "PREFER_DAY_OF_MONTH": "first",
+            "RETURN_AS_TIMEZONE_AWARE": False,
+            # Allow all languages supported by dateparser (FR, EN, AR, ES, PT …)
+            "PREFER_LOCALE_DATE_ORDER": True,
+        },
     )
+    if parsed is not None:
+        logger.debug("dateparser resolved %r → %s", raw, parsed)
+        return parsed
+
+    logger.warning("Could not parse date %r — storing None.", raw)
+    return None
