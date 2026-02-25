@@ -114,7 +114,7 @@ cp .env.example .env
 # Edit .env and fill in your actual credentials
 ```
 
-### 5. Run the backend locally
+### 5. Run the backend locally (after completing step 7)
 
 ```bash
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
@@ -123,7 +123,23 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 The API will be available at `http://localhost:8000`.
 Interactive docs at `http://localhost:8000/docs`.
 
-### 6. Run the database migration
+### 6. Download the embedding model (first run only)
+
+The embedding model (`intfloat/multilingual-e5-large`, ~1.1 GB) is downloaded
+automatically from HuggingFace the first time the server starts.  It is cached
+in `~/.cache/huggingface/` and reused on all subsequent starts.
+
+To pre-download it manually (useful on servers with restricted internet access
+at runtime):
+
+```bash
+python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('intfloat/multilingual-e5-large')"
+```
+
+> **Note:** Initial model load takes ~10 seconds on CPU.  The FastAPI startup
+> event pre-loads the model so upload requests are not penalised by this delay.
+
+### 7. Run the database migration
 
 Open the [Supabase SQL editor](https://supabase.com/dashboard/project/_/sql) for your project and run the contents of [backend/db/migrations/001_create_reviews.sql](backend/db/migrations/001_create_reviews.sql).
 

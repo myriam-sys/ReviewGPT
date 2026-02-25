@@ -1,21 +1,27 @@
 """
-Upload router — CSV / XLSX ingestion and session preview endpoints.
+Upload router — CSV / XLSX ingestion, preview, and embedding-status endpoints.
 
 Endpoints
 ---------
 POST /upload
     Accept a multipart CSV or Excel file, run the full ingestion pipeline,
-    and return an ``UploadResponse`` describing the outcome.
+    persist reviews to Supabase, queue a background embedding task, and return
+    an ``UploadResponse`` describing the outcome.
 
 GET /upload/{session_id}/preview
     Return the first N cleaned reviews for a session so the frontend can show
     the user what was successfully parsed before they proceed to the chat.
 
+GET /upload/{session_id}/embedding-status
+    Poll the progress of the background embedding task started by POST /upload.
+    Returns counts of embedded vs. pending reviews and a ``status`` string.
+
 Storage note
 ------------
-Validated reviews are stored in the module-level ``_session_store`` dict for
-Phase 1.  This is intentionally simple — no DB, no persistence across
-restarts.  Phase 2 will replace this with Supabase writes.
+Validated reviews are stored in the module-level ``_session_store`` dict so
+the preview endpoint works even when Supabase is unavailable.  DB persistence
+(Phase 2) and vector embedding (Phase 3) are both best-effort — errors are
+logged but never surface to the caller as HTTP errors.
 """
 
 from __future__ import annotations
@@ -24,11 +30,18 @@ import logging
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile, status
 
 from backend.core.config import settings
-from backend.models.schemas import PreviewResponse, ReviewClean, UploadResponse
+from backend.db.supabase_client import get_client
+from backend.models.schemas import (
+    EmbeddingStatusResponse,
+    PreviewResponse,
+    ReviewClean,
+    UploadResponse,
+)
 from backend.services.ingestion_service import (
+    compute_and_store_embeddings,
     parse_file,
     save_reviews_to_db,
     validate_and_clean,
@@ -79,6 +92,7 @@ _ALLOWED_EXTENSIONS: frozenset[str] = frozenset({".csv", ".xlsx", ".xls"})
 )
 async def upload_csv(
     file: Annotated[UploadFile, File(description="CSV or Excel file of Google Maps reviews.")],
+    background_tasks: BackgroundTasks,
 ) -> UploadResponse:
     """
     Ingest a CSV or Excel file of Google Maps reviews.
@@ -167,15 +181,26 @@ async def upload_csv(
             session_id,
         )
 
+    # ── Queue background embedding ────────────────────────────────────────────
+    # Only useful when rows actually landed in the DB and have text to embed.
+    if inserted_rows > 0 and reviews_with_text > 0:
+        background_tasks.add_task(compute_and_store_embeddings, session_id)
+        embedding_status = "embedding_queued"
+    elif reviews_with_text == 0:
+        embedding_status = "nothing_to_embed"
+    else:
+        embedding_status = "embedding_skipped"
+
     logger.info(
         "Ingestion complete — session=%s total=%d valid=%d invalid=%d "
-        "embeddable=%d inserted=%d",
+        "embeddable=%d inserted=%d embedding=%s",
         session_id,
         total_rows,
         len(valid_reviews),
         len(errors),
         reviews_with_text,
         inserted_rows,
+        embedding_status,
     )
 
     return UploadResponse(
@@ -185,6 +210,7 @@ async def upload_csv(
         invalid_rows=len(errors),
         reviews_with_text=reviews_with_text,
         inserted_rows=inserted_rows,
+        embedding_status=embedding_status,
         errors=errors,
     )
 
@@ -231,6 +257,92 @@ async def preview_session(session_id: str) -> PreviewResponse:
     return PreviewResponse(
         session_id=session_id,
         reviews=reviews[: settings.preview_row_limit],
+    )
+
+
+# ── GET /upload/{session_id}/embedding-status ─────────────────────────────────
+
+
+@router.get(
+    "/{session_id}/embedding-status",
+    response_model=EmbeddingStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Poll embedding progress for a session",
+    description=(
+        "Returns the number of reviews that have been embedded so far "
+        "vs. the total that need embedding.  Poll this endpoint after "
+        "``POST /upload`` until ``status`` is ``'complete'``."
+    ),
+)
+async def embedding_status_endpoint(session_id: str) -> EmbeddingStatusResponse:
+    """
+    Query Supabase for embedding progress of *session_id*.
+
+    Counts rows where ``has_text=True`` (total_with_text) and the subset
+    where ``embedding IS NOT NULL`` (embedded) to derive progress.
+
+    Parameters
+    ----------
+    session_id:
+        The UUID returned by ``POST /upload``.
+
+    Returns
+    -------
+    EmbeddingStatusResponse
+        Counts and a ``status`` string: ``"complete"``, ``"processing"``,
+        or ``"empty"`` when no text-bearing reviews exist.
+
+    Raises
+    ------
+    503 Service Unavailable
+        When Supabase credentials are not configured.
+    """
+    try:
+        client = get_client()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database client is not configured.",
+        ) from exc
+
+    # Total reviews with text for this session.
+    total_result = (
+        client.table("reviews")
+        .select("review_id", count="exact")
+        .eq("session_id", session_id)
+        .eq("has_text", True)
+        .execute()
+    )
+    total_with_text: int = total_result.count or 0
+
+    if total_with_text == 0:
+        return EmbeddingStatusResponse(
+            session_id=session_id,
+            total_with_text=0,
+            embedded=0,
+            pending=0,
+            status="empty",
+        )
+
+    # Reviews that already have a vector.
+    embedded_result = (
+        client.table("reviews")
+        .select("review_id", count="exact")
+        .eq("session_id", session_id)
+        .eq("has_text", True)
+        .filter("embedding", "not.is", "null")
+        .execute()
+    )
+    embedded: int = embedded_result.count or 0
+    pending = total_with_text - embedded
+    embedding_status_str = "complete" if pending == 0 else "processing"
+
+    return EmbeddingStatusResponse(
+        session_id=session_id,
+        total_with_text=total_with_text,
+        embedded=embedded,
+        pending=pending,
+        status=embedding_status_str,
     )
 
 

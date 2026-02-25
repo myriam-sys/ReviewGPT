@@ -528,6 +528,124 @@ def save_reviews_to_db(reviews: list[ReviewClean], session_id: str) -> int:
     return inserted
 
 
+def compute_and_store_embeddings(session_id: str) -> int:
+    """
+    Embed all text-bearing, un-embedded reviews for *session_id* and persist
+    the vectors to Supabase.
+
+    This function is designed to run as a FastAPI ``BackgroundTask`` — it is
+    called *after* the HTTP response has already been sent to the client, so
+    its runtime (30–60 s on CPU for a typical upload) does not block the API.
+
+    Pipeline
+    --------
+    1. Query Supabase for rows where ``session_id`` matches, ``has_text=True``,
+       and ``embedding IS NULL``.
+    2. Split the resulting texts into batches of 32 and call
+       ``embed_passages`` (which applies the ``"passage: "`` prefix).
+    3. For each (review_id, vector) pair, ``UPDATE`` the row in Supabase.
+    4. Log progress every 10 reviews so long jobs are visible in server logs.
+
+    Errors are caught per-batch so a single bad batch does not abort the
+    entire session — the remaining reviews are still processed.
+
+    Parameters
+    ----------
+    session_id:
+        The upload session UUID whose reviews should be embedded.
+
+    Returns
+    -------
+    int
+        Total number of reviews successfully embedded and updated in the DB.
+    """
+    # Inline import to avoid a module-level circular dependency between
+    # ingestion_service and embedding_service (each imports from db/models).
+    from backend.services.embedding_service import embed_passages  # noqa: PLC0415
+
+    logger.info("Starting embedding pass — session=%s", session_id)
+
+    try:
+        client = get_client()
+    except RuntimeError:
+        logger.exception(
+            "Supabase client unavailable — skipping embedding for session=%s",
+            session_id,
+        )
+        return 0
+
+    # Fetch reviews that have text but haven't been embedded yet.
+    result = (
+        client.table("reviews")
+        .select("review_id, text")
+        .eq("session_id", session_id)
+        .eq("has_text", True)
+        .is_("embedding", "null")
+        .execute()
+    )
+    rows = result.data
+
+    if not rows:
+        logger.info(
+            "No embeddable reviews found — session=%s (all embedded or no text)",
+            session_id,
+        )
+        return 0
+
+    logger.info(
+        "Embedding %d reviews — session=%s", len(rows), session_id
+    )
+
+    _EMBED_BATCH = 32  # must match embedding_service._BATCH_SIZE
+    embedded = 0
+
+    for batch_start in range(0, len(rows), _EMBED_BATCH):
+        batch = rows[batch_start : batch_start + _EMBED_BATCH]
+        texts = [r["text"] for r in batch]
+
+        # ── Compute vectors for this batch ───────────────────────────────────
+        try:
+            vectors = embed_passages(texts)
+        except Exception:
+            logger.exception(
+                "Embedding failed for batch [%d:%d] — session=%s — skipping batch",
+                batch_start,
+                batch_start + len(batch),
+                session_id,
+            )
+            continue
+
+        # ── Persist each vector individually ─────────────────────────────────
+        for row, vector in zip(batch, vectors):
+            try:
+                client.table("reviews").update(
+                    {"embedding": vector}
+                ).eq("review_id", row["review_id"]).execute()
+                embedded += 1
+            except Exception:
+                logger.exception(
+                    "DB update failed for review_id=%s — session=%s",
+                    row["review_id"],
+                    session_id,
+                )
+
+            if embedded > 0 and embedded % 10 == 0:
+                logger.info(
+                    "Embedding progress — session=%s embedded=%d / %d",
+                    session_id,
+                    embedded,
+                    len(rows),
+                )
+
+    logger.info(
+        "Embedding complete — session=%s total_embedded=%d / %d",
+        session_id,
+        embedded,
+        len(rows),
+    )
+    return embedded
+
+
 def detect_language(text: str) -> str:
     """
     Detect the ISO 639-1 language code of *text* using ``langdetect``.
