@@ -35,7 +35,7 @@ class Settings(BaseSettings):
 
     # ── Groq ──────────────────────────────────────────────────────────────────
     groq_api_key: str = ""
-    groq_model: str = "llama3-8b-8192"
+    groq_model: str = "llama-3.1-8b-instant"
 
     # ── Embeddings ────────────────────────────────────────────────────────────
     embedding_model: str = "intfloat/multilingual-e5-large"

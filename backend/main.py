@@ -11,7 +11,7 @@ import logging
 
 from fastapi import FastAPI
 
-from backend.routers import upload
+from backend.routers import chat, upload
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +23,7 @@ app = FastAPI(
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(upload.router, prefix="/upload", tags=["upload"])
-
-# TODO: Register chat router (Phase 4)
-# from backend.routers import chat
-# app.include_router(chat.router, prefix="/chat", tags=["chat"])
+app.include_router(chat.router, prefix="/chat", tags=["chat"])
 
 # TODO: Add CORS middleware before deploying frontend
 
