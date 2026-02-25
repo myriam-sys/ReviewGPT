@@ -25,6 +25,9 @@ groq==0.11.0                  # Official Groq Python SDK for calling llama3/mixt
 # ── HTTP client ────────────────────────────────────────────────────────────────
 httpx==0.27.2                 # Async HTTP client used internally by Supabase SDK
 
+# ── Excel support ──────────────────────────────────────────────────────────────
+openpyxl==3.1.5               # Read/write XLSX files via pd.read_excel(engine='openpyxl')
+
 # ── Language detection & date parsing ─────────────────────────────────────────
 langdetect==1.0.9             # Detect ISO 639-1 language code from review text
 dateparser==1.2.0             # Parse relative/multilingual date strings ("il y a 2 ans", "3 months ago")

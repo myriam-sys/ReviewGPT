@@ -1,11 +1,11 @@
 """
-Upload router — CSV ingestion and session preview endpoints.
+Upload router — CSV / XLSX ingestion and session preview endpoints.
 
 Endpoints
 ---------
 POST /upload
-    Accept a multipart CSV file, run the full ingestion pipeline, and return
-    an ``UploadResponse`` describing the outcome.
+    Accept a multipart CSV or Excel file, run the full ingestion pipeline,
+    and return an ``UploadResponse`` describing the outcome.
 
 GET /upload/{session_id}/preview
     Return the first N cleaned reviews for a session so the frontend can show
@@ -28,7 +28,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from backend.core.config import settings
 from backend.models.schemas import PreviewResponse, ReviewClean, UploadResponse
-from backend.services.ingestion_service import parse_csv, validate_and_clean
+from backend.services.ingestion_service import parse_file, validate_and_clean
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +40,23 @@ router = APIRouter()
 _session_store: dict[str, list[ReviewClean]] = {}
 
 # Allowed MIME types and file extensions for uploaded files.
-_ALLOWED_CONTENT_TYPES: frozenset[str] = frozenset(
-    {"text/csv", "application/csv", "text/plain", "application/octet-stream"}
-)
-_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({".csv"})
+# Content-type is browser-reported and unreliable; extension is a secondary
+# signal.  The authoritative format check is done via magic bytes inside
+# parse_file — these sets only serve as a fast early-rejection gate.
+_ALLOWED_CONTENT_TYPES: frozenset[str] = frozenset({
+    # CSV
+    "text/csv",
+    "application/csv",
+    "text/plain",
+    # Excel XLSX
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    # Excel XLS (legacy)
+    "application/vnd.ms-excel",
+    "application/excel",
+    # Generic binary — many browsers send this for both CSV and Excel
+    "application/octet-stream",
+})
+_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({".csv", ".xlsx", ".xls"})
 
 
 # ── POST /upload ──────────────────────────────────────────────────────────────
@@ -53,23 +66,23 @@ _ALLOWED_EXTENSIONS: frozenset[str] = frozenset({".csv"})
     "",
     response_model=UploadResponse,
     status_code=status.HTTP_200_OK,
-    summary="Upload a Google Maps review CSV",
+    summary="Upload a Google Maps review CSV or Excel file",
     description=(
-        "Accepts a CSV file via multipart/form-data, validates every row, "
-        "and returns a summary of what was ingested.  Use the returned "
-        "``session_id`` to query the preview or chat endpoints."
+        "Accepts a .csv, .xlsx, or .xls file via multipart/form-data, "
+        "validates every row, and returns a summary of what was ingested. "
+        "Use the returned ``session_id`` to query the preview or chat endpoints."
     ),
 )
 async def upload_csv(
-    file: Annotated[UploadFile, File(description="CSV file of Google Maps reviews.")],
+    file: Annotated[UploadFile, File(description="CSV or Excel file of Google Maps reviews.")],
 ) -> UploadResponse:
     """
-    Ingest a CSV file of Google Maps reviews.
+    Ingest a CSV or Excel file of Google Maps reviews.
 
     The pipeline is:
-    1. Reject files that are not CSV by extension or content-type.
+    1. Reject files whose extension and content-type are both unrecognised.
     2. Enforce the configured maximum file size (``MAX_UPLOAD_BYTES``).
-    3. Parse the raw bytes into a DataFrame (UTF-8 / Latin-1 fallback).
+    3. Detect format via magic bytes and parse into a DataFrame.
     4. Validate and clean every row via ``ingestion_service``.
     5. Store the valid reviews in the in-memory session store.
     6. Return ``UploadResponse`` with counts and any per-row errors.
@@ -77,7 +90,7 @@ async def upload_csv(
     Parameters
     ----------
     file:
-        The uploaded CSV file.
+        The uploaded CSV or Excel file.
 
     Returns
     -------
@@ -87,11 +100,11 @@ async def upload_csv(
     Raises
     ------
     400 Bad Request
-        When the file type is not CSV.
+        When the file type is not CSV or Excel.
     413 Request Entity Too Large
         When the file exceeds ``MAX_UPLOAD_BYTES``.
     422 Unprocessable Entity
-        When the CSV cannot be parsed (bad encoding, missing required columns).
+        When the file cannot be parsed (bad encoding, missing required columns).
     500 Internal Server Error
         For unexpected failures.
     """
@@ -112,7 +125,7 @@ async def upload_csv(
     logger.info("Starting ingestion — session=%s file=%s", session_id, file.filename)
 
     try:
-        df = parse_csv(file_bytes)
+        df = parse_file(file_bytes, filename=file.filename or "")
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -200,11 +213,15 @@ async def preview_session(session_id: str) -> PreviewResponse:
 
 def _validate_file_type(file: UploadFile) -> None:
     """
-    Raise ``HTTP 400`` if *file* is not a CSV based on extension or content-type.
+    Raise ``HTTP 400`` if *file* is clearly not a supported format.
 
-    Both checks are performed because browsers and OS file pickers report
-    content-type inconsistently for CSV files (e.g. ``text/plain`` on some
-    systems, ``application/octet-stream`` on others).
+    This is a fast pre-flight check before the bytes are read.  It rejects
+    obviously wrong uploads (e.g. images, PDFs) without consuming memory.
+    The authoritative format detection happens later via magic bytes inside
+    ``parse_file`` — this gate only checks extension and content-type.
+
+    The file passes if *either* its extension or its content-type is in the
+    allowed sets, because browsers report both inconsistently.
 
     Parameters
     ----------
@@ -214,7 +231,7 @@ def _validate_file_type(file: UploadFile) -> None:
     Raises
     ------
     HTTPException (400)
-        When neither the extension nor the content-type indicates a CSV.
+        When neither the extension nor the content-type is recognised.
     """
     filename = file.filename or ""
     extension = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -224,7 +241,7 @@ def _validate_file_type(file: UploadFile) -> None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"Invalid file type. Expected a .csv file, "
+                f"Invalid file type. Expected .csv, .xlsx, or .xls — "
                 f"got extension={extension!r} content_type={content_type!r}."
             ),
         )

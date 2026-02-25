@@ -1,5 +1,5 @@
 """
-Ingestion service — pure-Python CSV parsing, column mapping, and row validation.
+Ingestion service — pure-Python file parsing, column mapping, and row validation.
 
 This module has zero FastAPI dependencies and can be exercised in isolation
 (unit tests, CLI scripts, etc.).  The upload router is the only caller in
@@ -7,10 +7,17 @@ production.
 
 Pipeline
 --------
-1. ``parse_csv``         — decode bytes, parse CSV into a DataFrame.
+1. ``parse_file``        — detect format (CSV / XLSX / XLS), parse into a DataFrame.
 2. ``detect_columns``    — map arbitrary column names to canonical ones.
 3. ``validate_and_clean``— row-by-row validation, returns clean records + errors.
 4. ``detect_language``   — ISO 639-1 language detection via langdetect.
+
+Format detection
+----------------
+``parse_file`` inspects the first 4 bytes of the file (magic bytes) to
+determine the format, regardless of browser-reported content-type or file
+extension.  Downstream functions (``detect_columns``, ``validate_and_clean``)
+always receive a plain ``DataFrame`` and are completely format-agnostic.
 """
 
 from __future__ import annotations
@@ -28,6 +35,13 @@ from pydantic import ValidationError
 from backend.models.schemas import ReviewClean, RowError
 
 logger = logging.getLogger(__name__)
+
+# ── Magic bytes for binary format detection ───────────────────────────────────
+# Checked against the first 4 bytes of the uploaded file.  Browser-reported
+# content-type is unreliable, so byte signatures are used as ground truth.
+
+_XLSX_MAGIC: bytes = b"\x50\x4B\x03\x04"  # ZIP/PK — XLSX uses the OOXML/ZIP container
+_XLS_MAGIC: bytes = b"\xD0\xCF\x11\xE0"   # OLE2 compound document — legacy .xls format
 
 # ── Column alias dictionary ───────────────────────────────────────────────────
 # Maps every known alternate column name (lower-cased, stripped) to its
@@ -90,26 +104,35 @@ REQUIRED_CANONICAL_COLUMNS: frozenset[str] = frozenset({"rating", "date", "text"
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def parse_csv(file_bytes: bytes) -> pd.DataFrame:
+def parse_file(file_bytes: bytes, filename: str = "") -> pd.DataFrame:
     """
-    Decode *file_bytes* and parse them into a ``DataFrame``.
+    Detect the file format and parse *file_bytes* into a ``DataFrame``.
 
-    Encoding and separator detection strategy
-    -----------------------------------------
-    1. Attempt UTF-8 (covers the vast majority of modern exports).
-    2. Fall back to Latin-1 / ISO-8859-1, which handles most Western-European
-       Google Maps exports that include accented characters.
+    Format detection strategy (most reliable first)
+    ------------------------------------------------
+    1. **Magic bytes** — the first 4 bytes identify XLSX (``PK/ZIP``) and
+       legacy XLS (``OLE2``) unambiguously, regardless of extension or
+       browser-reported content-type.
+    2. **Extension fallback** — consulted only when magic bytes produce no
+       match, i.e. for text files (CSV, TSV) which have no binary signature.
 
-    For each encoding, ``sep=None, engine='python'`` is passed to
-    ``pd.read_csv`` so that Python's built-in CSV sniffer automatically
-    detects the delimiter (comma, semicolon, tab, pipe, etc.).  This covers
-    the common case of French/European exports that use ``;`` as the
-    separator.
+    Dispatches to
+    -------------
+    - ``_parse_csv``   : UTF-8 BOM + Latin-1 fallback; ``sep=None`` for
+                         automatic delimiter detection.
+    - ``_parse_excel`` : ``openpyxl`` engine for XLSX, auto-selected engine
+                         for legacy XLS.
+
+    The rest of the pipeline (``detect_columns``, ``validate_and_clean``) is
+    format-agnostic — it always receives a plain ``DataFrame``.
 
     Parameters
     ----------
     file_bytes:
-        Raw bytes of the uploaded CSV file.
+        Raw bytes of the uploaded file.
+    filename:
+        Original filename, used for the extension-based fallback and log
+        messages.  Safe to omit; defaults to an empty string.
 
     Returns
     -------
@@ -120,15 +143,101 @@ def parse_csv(file_bytes: bytes) -> pd.DataFrame:
     Raises
     ------
     ValueError
-        When the bytes cannot be decoded or parsed as CSV.
+        When the file cannot be parsed in any supported format.
     """
-    for encoding in ("utf-8", "latin-1"):
+    fmt = _detect_format(file_bytes, filename)
+    logger.debug("Format detected for %r: %s", filename, fmt)
+
+    if fmt == "xlsx":
+        return _parse_excel(file_bytes, engine="openpyxl")
+    if fmt == "xls":
+        # Legacy XLS requires the optional `xlrd` package.  pandas will
+        # raise ImportError if it is absent; _parse_excel surfaces that as
+        # a user-friendly ValueError.
+        return _parse_excel(file_bytes, engine=None)
+    return _parse_csv(file_bytes)
+
+
+# ── Private format helpers ─────────────────────────────────────────────────────
+
+
+def _detect_format(file_bytes: bytes, filename: str) -> str:
+    """
+    Return the file format string: ``"xlsx"``, ``"xls"``, or ``"csv"``.
+
+    Magic bytes (first 4 bytes of the file) are the primary signal.  The
+    file extension is only consulted when magic bytes do not identify a
+    known binary format — i.e. for plain-text files.
+
+    Parameters
+    ----------
+    file_bytes:
+        Raw file bytes (at least 4 bytes expected for reliable detection).
+    filename:
+        Original filename used for extension-based fallback and warnings.
+
+    Returns
+    -------
+    str
+        One of ``"xlsx"``, ``"xls"``, or ``"csv"``.
+    """
+    header = file_bytes[:4]
+
+    if header == _XLSX_MAGIC:
+        return "xlsx"
+    if header == _XLS_MAGIC:
+        return "xls"
+
+    # No binary magic matched — file is assumed to be text/CSV.
+    # Warn if the extension looks like Excel, as the file may be malformed.
+    ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
+    if ext in (".xlsx", ".xls"):
+        logger.warning(
+            "File %r has extension %r but no matching magic bytes — "
+            "attempting to parse as CSV.",
+            filename,
+            ext,
+        )
+    return "csv"
+
+
+def _parse_csv(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Decode *file_bytes* as a delimiter-separated text file and return a DataFrame.
+
+    Encoding strategy
+    -----------------
+    1. ``utf-8-sig`` — handles both plain UTF-8 and UTF-8-with-BOM (the BOM
+       that Excel adds when exporting CSVs is stripped automatically).
+    2. ``latin-1`` — covers Western-European exports with accented characters
+       that are not valid UTF-8.
+
+    ``sep=None, engine='python'`` delegates delimiter detection to Python's
+    built-in ``csv.Sniffer``, covering commas, semicolons, tabs, pipes, and
+    other separators automatically.
+
+    Parameters
+    ----------
+    file_bytes:
+        Raw bytes of a CSV or other delimiter-separated text file.
+
+    Returns
+    -------
+    pd.DataFrame
+        All columns as ``object`` dtype (strings).
+
+    Raises
+    ------
+    ValueError
+        When the bytes cannot be decoded or parsed.
+    """
+    for encoding in ("utf-8-sig", "latin-1"):
         try:
             text = file_bytes.decode(encoding)
             df = pd.read_csv(
                 io.StringIO(text),
-                sep=None,           # let pandas sniff the delimiter
-                engine="python",    # required when sep=None
+                sep=None,        # let Python's csv.Sniffer detect the delimiter
+                engine="python", # required when sep=None
                 dtype=str,
                 keep_default_na=False,
             )
@@ -148,6 +257,57 @@ def parse_csv(file_bytes: bytes) -> pd.DataFrame:
         "Could not decode the file as UTF-8 or Latin-1. "
         "Please re-save the CSV with UTF-8 encoding."
     )
+
+
+def _parse_excel(file_bytes: bytes, engine: str | None) -> pd.DataFrame:
+    """
+    Parse *file_bytes* as an Excel workbook and return the first sheet.
+
+    Parameters
+    ----------
+    file_bytes:
+        Raw bytes of an XLSX or XLS workbook.
+    engine:
+        ``pandas.read_excel`` engine.  Pass ``"openpyxl"`` for XLSX; pass
+        ``None`` to let pandas auto-select for legacy XLS (requires ``xlrd``
+        to be installed separately).
+
+    Returns
+    -------
+    pd.DataFrame
+        All columns as ``object`` dtype (strings).  Column names are cast to
+        ``str`` to handle workbooks that use numeric headers.
+
+    Raises
+    ------
+    ValueError
+        When the workbook cannot be read, or when the required engine
+        (e.g. ``xlrd`` for legacy XLS) is not installed.
+    """
+    try:
+        df = pd.read_excel(
+            io.BytesIO(file_bytes),
+            dtype=str,
+            engine=engine,
+            keep_default_na=False,
+        )
+        # Numeric column headers (e.g. unnamed columns) must be strings for
+        # detect_columns to process them correctly.
+        df.columns = df.columns.astype(str)
+        logger.debug(
+            "Excel parsed — engine=%s columns=%s shape=%s",
+            engine,
+            df.columns.tolist(),
+            df.shape,
+        )
+        return df
+    except ImportError as exc:
+        raise ValueError(
+            "Reading this Excel format requires an additional library. "
+            "Install 'xlrd' for legacy .xls files: pip install xlrd"
+        ) from exc
+    except Exception as exc:
+        raise ValueError(f"Excel parsing failed: {exc}") from exc
 
 
 def detect_columns(df: pd.DataFrame) -> dict[str, str]:
@@ -211,7 +371,7 @@ def validate_and_clean(
     Parameters
     ----------
     df:
-        DataFrame produced by ``parse_csv`` (all columns as strings).
+        DataFrame produced by ``parse_file`` (all columns as strings).
     session_id:
         Session identifier to embed in every ``ReviewClean`` record.
 
