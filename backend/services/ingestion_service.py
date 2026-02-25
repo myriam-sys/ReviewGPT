@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
 import dateparser
 import pandas as pd
+from dateutil.relativedelta import relativedelta  # transitive dep via dateparser
 from langdetect import detect, LangDetectException
 from pydantic import ValidationError
 
@@ -484,43 +486,90 @@ def detect_language(text: str) -> str:
         return "unknown"
 
 
+# ── French relative date helpers ──────────────────────────────────────────────
+
+# Matches "il y a <quantity> <unit>" produced by Google Maps FR exports.
+# Quantity is either a digit string or the words "un" / "une" (→ 1).
+# The prefix "Modifié " is stripped before this regex is applied.
+_FR_RELATIVE_RE: re.Pattern[str] = re.compile(
+    r"il\s+y\s+a\s+"          # literal "il y a" with any whitespace
+    r"(une?|\d+)"              # quantity: "un", "une", or one-or-more digits
+    r"\s+"
+    r"(ans?|mois|semaines?|jours?|heures?)",  # time unit (singular and plural)
+    re.IGNORECASE,
+)
+
+# Maps the normalised unit word to the matching relativedelta keyword.
+_FR_UNIT_TO_KWARG: dict[str, str] = {
+    "an":       "years",
+    "ans":      "years",
+    "mois":     "months",
+    "semaine":  "weeks",
+    "semaines": "weeks",
+    "jour":     "days",
+    "jours":    "days",
+    "heure":    "hours",
+    "heures":   "hours",
+}
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 
 def _parse_date(raw: str | None) -> datetime | None:
     """
-    Attempt to parse *raw* into a ``datetime``.
+    Parse *raw* into a ``datetime`` using a four-stage strategy.
 
-    Parsing strategy (in order)
-    ---------------------------
-    1. Explicit ``strptime`` formats — fast, unambiguous, covers well-formed
-       absolute dates in the 10 most common CSV export styles.
-    2. ``dateparser.parse`` — handles relative strings in multiple languages,
-       e.g. ``"il y a 2 ans"``, ``"Modifié il y a 3 mois"``,
-       ``"2 weeks ago"``, ``"X years ago"``.  ``PREFER_DAY_OF_MONTH`` and
-       ``RETURN_AS_TIMEZONE_AWARE=False`` keep the output consistent with the
-       strptime path.
+    Stage 1 — Normalisation
+    -----------------------
+    - Strip leading/trailing whitespace.
+    - Replace ``\\xa0`` (non-breaking space, common in Google Maps exports)
+      with a regular space.
+    - Remove the ``"Modifié "`` prefix emitted by the French Google Maps UI
+      when a review has been edited (e.g. ``"Modifié il y a 2 ans"``).
+
+    Stage 2 — Explicit ``strptime`` formats
+    ----------------------------------------
+    Ten common absolute date formats are tried in order from most specific
+    to least specific to avoid ambiguous matches (e.g. ``%d/%m/%Y`` before
+    ``%m/%d/%Y``).
+
+    Stage 3 — French relative patterns (regex)
+    -------------------------------------------
+    ``_FR_RELATIVE_RE`` matches ``"il y a <qty> <unit>"`` strings, where
+    *qty* is a digit string or ``"un"`` / ``"une"`` (→ 1).  The offset is
+    applied with ``dateutil.relativedelta`` against ``datetime.now()``.
+
+    Stage 4 — ``dateparser`` fallback
+    -----------------------------------
+    Catches anything not matched above (other ISO variants, English relative
+    strings, etc.).  ``RETURN_AS_TIMEZONE_AWARE=False`` keeps output
+    consistent with the strptime path.
 
     Parameters
     ----------
     raw:
-        Raw date string from the CSV, or ``None`` if the cell was empty.
+        Raw date string from the file, or ``None`` if the cell was empty.
 
     Returns
     -------
     datetime | None
-        Parsed datetime object, or ``None`` when *raw* is missing/empty or
-        cannot be parsed by either strategy.  A warning is logged in the
-        latter case so the issue is visible without rejecting the row.
+        Parsed datetime, or ``None`` when the string is absent or cannot be
+        resolved by any stage.  A warning is logged on failure so the issue
+        is visible in server logs without rejecting the row.
     """
     if not raw:
         logger.warning("Date field is missing or empty — storing None.")
         return None
 
-    # ── Stage 1: explicit strptime formats ────────────────────────────────────
-    # Ordered from most specific to least specific to avoid ambiguous matches
-    # (e.g. %d/%m/%Y must come before %m/%d/%Y).
-    formats = [
+    # ── Stage 1: normalise ────────────────────────────────────────────────────
+    s = raw.strip().replace("\xa0", " ")
+    # Remove "Modifié " prefix (handles both accented é and unaccented e,
+    # and any amount of whitespace after the word).
+    s = re.sub(r"^[Mm]odifi[eé]\s+", "", s)
+
+    # ── Stage 2: explicit strptime formats ────────────────────────────────────
+    # Ordered from most specific to least specific.
+    _FORMATS = [
         "%Y-%m-%dT%H:%M:%S",   # ISO 8601 with time
         "%Y-%m-%dT%H:%M:%SZ",  # ISO 8601 UTC
         "%Y-%m-%d %H:%M:%S",   # common DB export format
@@ -532,22 +581,30 @@ def _parse_date(raw: str | None) -> datetime | None:
         "%B %d, %Y",            # "January 15, 2024"
         "%b %d, %Y",            # "Jan 15, 2024"
     ]
-
-    for fmt in formats:
+    for fmt in _FORMATS:
         try:
-            return datetime.strptime(raw, fmt)
+            return datetime.strptime(s, fmt)
         except ValueError:
             continue
 
-    # ── Stage 2: dateparser — relative & multilingual strings ─────────────────
-    # Handles: "il y a 2 ans", "Modifié il y a 3 mois", "il y a un an",
-    #          "il y a 2 semaines", "2 years ago", "3 months ago", etc.
+    # ── Stage 3: French relative patterns ────────────────────────────────────
+    m = _FR_RELATIVE_RE.search(s)
+    if m:
+        qty_str = m.group(1).lower()
+        unit_str = m.group(2).lower()
+        amount = 1 if qty_str in ("un", "une") else int(qty_str)
+        kwarg = _FR_UNIT_TO_KWARG.get(unit_str)
+        if kwarg:
+            result = datetime.now() - relativedelta(**{kwarg: amount})
+            logger.debug("French relative date %r → %s", raw, result)
+            return result
+
+    # ── Stage 4: dateparser fallback ─────────────────────────────────────────
     parsed = dateparser.parse(
-        raw,
+        s,
         settings={
             "PREFER_DAY_OF_MONTH": "first",
             "RETURN_AS_TIMEZONE_AWARE": False,
-            # Allow all languages supported by dateparser (FR, EN, AR, ES, PT …)
             "PREFER_LOCALE_DATE_ORDER": True,
         },
     )
@@ -557,3 +614,22 @@ def _parse_date(raw: str | None) -> datetime | None:
 
     logger.warning("Could not parse date %r — storing None.", raw)
     return None
+
+    # ── Expected behaviour ────────────────────────────────────────────────────
+    # _parse_date(None)                              → None
+    # _parse_date("")                                → None
+    # _parse_date("2024-01-15")                      → datetime(2024, 1, 15, 0, 0)
+    # _parse_date("15/01/2024")                      → datetime(2024, 1, 15, 0, 0)
+    # _parse_date("il y a 2 ans")                    → now - relativedelta(years=2)
+    # _parse_date("il y a un an")                    → now - relativedelta(years=1)
+    # _parse_date("il y a 3 mois")                   → now - relativedelta(months=3)
+    # _parse_date("il y a un mois")                  → now - relativedelta(months=1)
+    # _parse_date("il y a 2 semaines")               → now - relativedelta(weeks=2)
+    # _parse_date("il y a une semaine")              → now - relativedelta(weeks=1)
+    # _parse_date("il y a 5 jours")                  → now - relativedelta(days=5)
+    # _parse_date("il y a un jour")                  → now - relativedelta(days=1)
+    # _parse_date("il y a 4 heures")                 → now - relativedelta(hours=4)
+    # _parse_date("il y a une heure")                → now - relativedelta(hours=1)
+    # _parse_date("Modifié il y a 2 ans")            → now - relativedelta(years=2)
+    # _parse_date("Modifié\xa0il\xa0y\xa0a 3 mois") → now - relativedelta(months=3)
+    # _parse_date("unparseable garbage")             → None
