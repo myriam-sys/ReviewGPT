@@ -33,7 +33,7 @@ from typing import Annotated
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile, status
 
 from backend.core.config import settings
-from backend.db.supabase_client import get_client
+from backend.db.supabase_client import get_asyncpg_pool
 from backend.models.schemas import (
     EmbeddingStatusResponse,
     PreviewResponse,
@@ -295,25 +295,32 @@ async def embedding_status_endpoint(session_id: str) -> EmbeddingStatusResponse:
     Raises
     ------
     503 Service Unavailable
-        When Supabase credentials are not configured.
+        When the database connection pool cannot be created.
     """
     try:
-        client = get_client()
+        pool = await get_asyncpg_pool()
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database client is not configured.",
+            detail="Database connection is not configured.",
         ) from exc
 
-    # Total reviews with text for this session.
-    total_result = (
-        client.table("reviews")
-        .select("review_id", count="exact")
-        .eq("session_id", session_id)
-        .eq("has_text", True)
-        .execute()
-    )
-    total_with_text: int = total_result.count or 0
+    # A single query returns both counts — more efficient than two round-trips.
+    # asyncpg is used because the SDK cannot filter on the vector column type.
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE has_text = TRUE)                          AS total_with_text,
+                COUNT(*) FILTER (WHERE has_text = TRUE AND embedding IS NOT NULL) AS embedded
+            FROM reviews
+            WHERE session_id = $1::uuid
+            """,
+            session_id,
+        )
+
+    total_with_text: int = row["total_with_text"] or 0
+    embedded: int = row["embedded"] or 0
 
     if total_with_text == 0:
         return EmbeddingStatusResponse(
@@ -324,16 +331,6 @@ async def embedding_status_endpoint(session_id: str) -> EmbeddingStatusResponse:
             status="empty",
         )
 
-    # Reviews that already have a vector.
-    embedded_result = (
-        client.table("reviews")
-        .select("review_id", count="exact")
-        .eq("session_id", session_id)
-        .eq("has_text", True)
-        .filter("embedding", "not.is", "null")
-        .execute()
-    )
-    embedded: int = embedded_result.count or 0
     pending = total_with_text - embedded
     embedding_status_str = "complete" if pending == 0 else "processing"
 

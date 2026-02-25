@@ -23,6 +23,7 @@ always receive a plain ``DataFrame`` and are completely format-agnostic.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import re
 from datetime import datetime
@@ -34,7 +35,7 @@ from dateutil.relativedelta import relativedelta  # transitive dep via dateparse
 from langdetect import detect, LangDetectException
 from pydantic import ValidationError
 
-from backend.db.supabase_client import get_client
+from backend.db.supabase_client import get_asyncpg_pool, get_client
 from backend.models.schemas import ReviewClean, RowError
 
 logger = logging.getLogger(__name__)
@@ -528,7 +529,7 @@ def save_reviews_to_db(reviews: list[ReviewClean], session_id: str) -> int:
     return inserted
 
 
-def compute_and_store_embeddings(session_id: str) -> int:
+async def compute_and_store_embeddings(session_id: str) -> int:
     """
     Embed all text-bearing, un-embedded reviews for *session_id* and persist
     the vectors to Supabase.
@@ -539,11 +540,13 @@ def compute_and_store_embeddings(session_id: str) -> int:
 
     Pipeline
     --------
-    1. Query Supabase for rows where ``session_id`` matches, ``has_text=True``,
-       and ``embedding IS NULL``.
+    1. Fetch rows via asyncpg where ``session_id`` matches, ``has_text=TRUE``,
+       and ``embedding IS NULL``.  asyncpg is used because the Supabase SDK
+       cannot filter or write the ``vector`` column type reliably.
     2. Split the resulting texts into batches of 32 and call
        ``embed_passages`` (which applies the ``"passage: "`` prefix).
-    3. For each (review_id, vector) pair, ``UPDATE`` the row in Supabase.
+    3. For each (review_id, vector) pair, run an asyncpg ``UPDATE`` that
+       casts the JSON-serialised vector to ``::vector``.
     4. Log progress every 10 reviews so long jobs are visible in server logs.
 
     Errors are caught per-batch so a single bad batch does not abort the
@@ -566,24 +569,27 @@ def compute_and_store_embeddings(session_id: str) -> int:
     logger.info("Starting embedding pass — session=%s", session_id)
 
     try:
-        client = get_client()
+        pool = await get_asyncpg_pool()
     except RuntimeError:
         logger.exception(
-            "Supabase client unavailable — skipping embedding for session=%s",
+            "asyncpg pool unavailable — skipping embedding for session=%s",
             session_id,
         )
         return 0
 
     # Fetch reviews that have text but haven't been embedded yet.
-    result = (
-        client.table("reviews")
-        .select("review_id, text")
-        .eq("session_id", session_id)
-        .eq("has_text", True)
-        .is_("embedding", "null")
-        .execute()
-    )
-    rows = result.data
+    # Use asyncpg directly: the SDK cannot filter on the vector column.
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT review_id::text, text
+            FROM reviews
+            WHERE session_id = $1::uuid
+              AND has_text  = TRUE
+              AND embedding IS NULL
+            """,
+            session_id,
+        )
 
     if not rows:
         logger.info(
@@ -592,9 +598,7 @@ def compute_and_store_embeddings(session_id: str) -> int:
         )
         return 0
 
-    logger.info(
-        "Embedding %d reviews — session=%s", len(rows), session_id
-    )
+    logger.info("Embedding %d reviews — session=%s", len(rows), session_id)
 
     _EMBED_BATCH = 32  # must match embedding_service._BATCH_SIZE
     embedded = 0
@@ -615,27 +619,30 @@ def compute_and_store_embeddings(session_id: str) -> int:
             )
             continue
 
-        # ── Persist each vector individually ─────────────────────────────────
-        for row, vector in zip(batch, vectors):
-            try:
-                client.table("reviews").update(
-                    {"embedding": vector}
-                ).eq("review_id", row["review_id"]).execute()
-                embedded += 1
-            except Exception:
-                logger.exception(
-                    "DB update failed for review_id=%s — session=%s",
-                    row["review_id"],
-                    session_id,
-                )
+        # ── Persist each vector via asyncpg (SDK cannot write vector type) ───
+        async with pool.acquire() as conn:
+            for row, vector in zip(batch, vectors):
+                try:
+                    await conn.execute(
+                        "UPDATE reviews SET embedding = $1::vector WHERE review_id = $2::uuid",
+                        json.dumps(vector),
+                        row["review_id"],
+                    )
+                    embedded += 1
+                except Exception:
+                    logger.exception(
+                        "DB update failed for review_id=%s — session=%s",
+                        row["review_id"],
+                        session_id,
+                    )
 
-            if embedded > 0 and embedded % 10 == 0:
-                logger.info(
-                    "Embedding progress — session=%s embedded=%d / %d",
-                    session_id,
-                    embedded,
-                    len(rows),
-                )
+                if embedded > 0 and embedded % 10 == 0:
+                    logger.info(
+                        "Embedding progress — session=%s embedded=%d / %d",
+                        session_id,
+                        embedded,
+                        len(rows),
+                    )
 
     logger.info(
         "Embedding complete — session=%s total_embedded=%d / %d",
