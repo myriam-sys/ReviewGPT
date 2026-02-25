@@ -18,6 +18,7 @@ transformers==4.44.2          # HuggingFace model hub & tokenizer utilities
 # ── Vector database ────────────────────────────────────────────────────────────
 supabase==2.7.4               # Official Supabase Python client (REST + realtime)
 vecs==0.4.3                   # Supabase vector store helper for pgvector operations
+asyncpg==0.29.0               # Async PostgreSQL driver for direct pgvector operations
 
 # ── LLM ────────────────────────────────────────────────────────────────────────
 groq==0.11.0                  # Official Groq Python SDK for calling llama3/mixtral
