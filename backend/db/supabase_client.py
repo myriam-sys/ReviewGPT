@@ -70,7 +70,11 @@ def _get_safe_db_url(raw_url: str) -> str:
     parsed = urlparse(raw_url)
     safe_password = quote_plus(parsed.password or "")
     netloc = f"{parsed.username}:{safe_password}@{parsed.hostname}:{parsed.port}"
-    return urlunparse(parsed._replace(netloc=netloc))
+    clean_url = urlunparse(parsed._replace(netloc=netloc))
+    # Supabase Session Pooler requires SSL; direct connections do not.
+    if "pooler.supabase.com" in raw_url:
+        clean_url += "?sslmode=require"
+    return clean_url
 
 
 # ── Public accessors ──────────────────────────────────────────────────────────
