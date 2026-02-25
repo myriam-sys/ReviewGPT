@@ -364,9 +364,13 @@ def validate_and_clean(
        missing columns.
     3. For each data row:
        a. Build a ``ReviewClean`` via Pydantic validation.
-       b. If the ``language`` field is absent or blank, run ``detect_language``
-          on the review text and set ``original_language_detected = True``.
-       c. Collect ``RowError`` for any row that fails validation.
+       b. If the ``language`` field is absent or blank AND the review text is
+          present, run ``detect_language`` and set
+          ``original_language_detected = True``.
+       c. Rows with empty/missing text are accepted with ``text=None`` and
+          ``has_text=False``; they are not rejected.
+       d. Collect ``RowError`` for any row that fails validation (e.g. bad
+          rating, missing required column).
 
     Parameters
     ----------
@@ -428,7 +432,7 @@ def validate_and_clean(
                 author=_get("author"),
                 rating=_get("rating"),  # coerced by field_validator
                 date=date_value,
-                text=text_value or "",  # empty string triggers min_length error
+                text=text_value,  # None when blank; has_text derives from this
                 language=language_from_csv,
                 original_language_detected=language_detected,
             )

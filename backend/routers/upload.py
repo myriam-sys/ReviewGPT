@@ -146,12 +146,15 @@ async def upload_csv(
     # Persist in the in-memory store for the preview endpoint.
     _session_store[session_id] = valid_reviews
 
+    reviews_with_text = sum(1 for r in valid_reviews if r.has_text)
+
     logger.info(
-        "Ingestion complete — session=%s total=%d valid=%d invalid=%d",
+        "Ingestion complete — session=%s total=%d valid=%d invalid=%d embeddable=%d",
         session_id,
         total_rows,
         len(valid_reviews),
         len(errors),
+        reviews_with_text,
     )
 
     return UploadResponse(
@@ -159,6 +162,7 @@ async def upload_csv(
         total_rows=total_rows,
         valid_rows=len(valid_reviews),
         invalid_rows=len(errors),
+        reviews_with_text=reviews_with_text,
         errors=errors,
     )
 
