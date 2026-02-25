@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Optional
+from urllib.parse import quote_plus, urlparse, urlunparse
 
 import asyncpg
 from supabase import Client, create_client
@@ -37,6 +38,39 @@ logger = logging.getLogger(__name__)
 _supabase_client: Optional[Client] = None
 _asyncpg_pool: Optional[asyncpg.Pool] = None
 _pool_lock = asyncio.Lock()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _get_safe_db_url(raw_url: str) -> str:
+    """
+    URL-encode the password component of a PostgreSQL connection string.
+
+    Supabase auto-generates passwords that may contain special characters
+    (``@``, ``#``, ``%``, ``+``, etc.).  asyncpg parses the URL naively, so
+    an unencoded special character in the password breaks the netloc split and
+    causes an authentication error.
+
+    ``urllib.parse.quote_plus`` percent-encodes every character that is not
+    safe in a URL password field, which asyncpg then decodes correctly before
+    sending it to PostgreSQL.
+
+    Parameters
+    ----------
+    raw_url:
+        The raw ``SUPABASE_DB_URL`` value from the environment, e.g.
+        ``postgresql://postgres:p@$$w0rd!@db.xyz.supabase.co:5432/postgres``.
+
+    Returns
+    -------
+    str
+        A fully URL-safe connection string with the password percent-encoded.
+    """
+    parsed = urlparse(raw_url)
+    safe_password = quote_plus(parsed.password or "")
+    netloc = f"{parsed.username}:{safe_password}@{parsed.hostname}:{parsed.port}"
+    return urlunparse(parsed._replace(netloc=netloc))
 
 
 # ── Public accessors ──────────────────────────────────────────────────────────
@@ -118,9 +152,10 @@ async def get_asyncpg_pool() -> asyncpg.Pool:
                 "Set SUPABASE_DB_URL in your .env file."
             )
 
+        safe_url = _get_safe_db_url(db_url)
         logger.info("Creating asyncpg connection pool")
         _asyncpg_pool = await asyncpg.create_pool(
-            db_url,
+            safe_url,
             min_size=1,
             max_size=10,
         )
