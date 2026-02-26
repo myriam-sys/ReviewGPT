@@ -30,7 +30,7 @@ from fastapi import APIRouter, HTTPException, status
 from backend.db.supabase_client import get_asyncpg_pool
 from backend.models.schemas import ChatRequest, ChatResponse
 from backend.services.llm_service import generate_response
-from backend.services.retrieval_service import get_session_stats, retrieve_similar_reviews
+from backend.services.retrieval_service import retrieve_context
 
 logger = logging.getLogger(__name__)
 
@@ -124,47 +124,37 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 ),
             )
 
-    # ── 4. Retrieve similar reviews ───────────────────────────────────────────
+    # ── 4. Build question context (classify + retrieve + stats) ──────────────
     try:
-        retrieved = await retrieve_similar_reviews(
-            query=question,
+        context = await retrieve_context(
+            question=question,
             session_id=session_id,
             top_k=top_k,
         )
     except Exception as exc:
-        logger.exception("Similarity search failed — session=%s", session_id)
+        logger.exception("Context retrieval failed — session=%s", session_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to retrieve similar reviews from the database.",
+            detail="Failed to retrieve context from the database.",
         ) from exc
 
+    question_type = context["question_type"]["type"]
+    reviews_retrieved = len(
+        context.get("reviews",
+                    context.get("positive_reviews", []) + context.get("negative_reviews", []))
+    )
     logger.info(
-        "Retrieved %d relevant reviews — session=%s", len(retrieved), session_id
+        "Context assembled — session=%s type=%s reviews=%d",
+        session_id,
+        question_type,
+        reviews_retrieved,
     )
 
-    # ── 5. Fetch session statistics for LLM context ───────────────────────────
-    try:
-        stats = await get_session_stats(session_id)
-    except Exception:
-        # Non-fatal — the LLM can still answer without stats context.
-        logger.exception(
-            "Failed to fetch session stats — session=%s — continuing without stats",
-            session_id,
-        )
-        stats = {
-            "total_reviews": 0,
-            "reviews_with_text": 0,
-            "avg_rating": None,
-            "language_distribution": {},
-            "date_range": None,
-        }
-
-    # ── 6. Generate LLM response ──────────────────────────────────────────────
+    # ── 5. Generate LLM response ──────────────────────────────────────────────
     try:
         llm_result = await generate_response(
             question=question,
-            retrieved_reviews=retrieved,
-            session_stats=stats,
+            context=context,
         )
     except RuntimeError as exc:
         # Groq API key not configured
@@ -180,11 +170,12 @@ async def chat(request: ChatRequest) -> ChatResponse:
         ) from exc
 
     logger.info(
-        "Chat complete — session=%s model=%s tokens=%d sources=%d",
+        "Chat complete — session=%s model=%s tokens=%d sources=%d type=%s",
         session_id,
         llm_result["model"],
         llm_result["tokens_used"],
         llm_result["sources_count"],
+        llm_result["question_type"],
     )
 
     return ChatResponse(
@@ -195,4 +186,5 @@ async def chat(request: ChatRequest) -> ChatResponse:
         retrieved_reviews=llm_result["retrieved_reviews"],
         session_id=session_id,
         question=question,
+        question_type=llm_result["question_type"],
     )

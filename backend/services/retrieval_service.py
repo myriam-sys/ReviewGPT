@@ -209,3 +209,266 @@ async def get_session_stats(session_id: str) -> dict[str, Any]:
         "rating_distribution": rating_distribution,
         "date_range": date_range,
     }
+
+
+# ── Query classification ───────────────────────────────────────────────────────
+
+_ANALYTICAL_KEYWORDS: frozenset[str] = frozenset({
+    "moyenne", "average", "combien", "how many", "pourcentage",
+    "percent", "total", "distribution", "note", "rating", "score",
+    "nombre", "count", "statistique", "stats",
+})
+_TEMPORAL_KEYWORDS: frozenset[str] = frozenset({
+    "évolution", "évolu", "tendance", "trend", "récent", "recent",
+    "dernièr", "latest", "avant", "before", "après", "after", "année", "year",
+    "mois", "month", "améliore", "dégrade", "over time", "changed",
+})
+_COMPARATIVE_KEYWORDS: frozenset[str] = frozenset({
+    "différence", "difference", "compar", "positif", "négatif",
+    "positive", "negative", "mieux", "better", "worse", "pire",
+    "versus", "vs", "contrast",
+})
+_AUTHOR_KEYWORDS: frozenset[str] = frozenset({
+    "qui", "who", "auteur", "author", "client", "customer",
+    "personne", "person", "nom", "name", "mentionn",
+})
+
+
+def classify_question(question: str) -> dict[str, Any]:
+    """
+    Classify a question into one of five types using case-insensitive keyword
+    matching (no LLM call — pure Python, zero latency).
+
+    Types
+    -----
+    "analytical"  : numerical questions (averages, counts, distributions).
+    "temporal"    : questions about trends or evolution over time.
+    "comparative" : questions comparing positive vs negative feedback.
+    "author"      : questions about specific reviewers or people.
+    "search"      : default — qualitative questions about topics / themes.
+
+    Returns
+    -------
+    dict
+        ``type`` (str), ``suggested_top_k`` (int),
+        ``fetch_positive_negative_split`` (bool),
+        ``use_stats_prominently`` (bool).
+    """
+    q = question.lower()
+    if any(kw in q for kw in _ANALYTICAL_KEYWORDS):
+        return {
+            "type": "analytical",
+            "suggested_top_k": 5,
+            "fetch_positive_negative_split": False,
+            "use_stats_prominently": True,
+        }
+    if any(kw in q for kw in _TEMPORAL_KEYWORDS):
+        return {
+            "type": "temporal",
+            "suggested_top_k": 10,
+            "fetch_positive_negative_split": False,
+            "use_stats_prominently": True,
+        }
+    if any(kw in q for kw in _COMPARATIVE_KEYWORDS):
+        return {
+            "type": "comparative",
+            "suggested_top_k": 10,
+            "fetch_positive_negative_split": True,
+            "use_stats_prominently": False,
+        }
+    if any(kw in q for kw in _AUTHOR_KEYWORDS):
+        return {
+            "type": "author",
+            "suggested_top_k": 5,
+            "fetch_positive_negative_split": False,
+            "use_stats_prominently": False,
+        }
+    return {
+        "type": "search",
+        "suggested_top_k": 10,
+        "fetch_positive_negative_split": False,
+        "use_stats_prominently": False,
+    }
+
+
+async def retrieve_context(
+    question: str,
+    session_id: str,
+    top_k: int,
+) -> dict[str, Any]:
+    """
+    Orchestrate context assembly for the RAG pipeline based on question type.
+
+    1. Classifies the question with ``classify_question`` (keyword matching).
+    2. Fetches session statistics (non-fatal — falls back to empty dict on error).
+    3. Retrieves reviews in a type-appropriate way:
+
+       analytical  — top-5 similarity search; stats are the primary answer source.
+       temporal    — most recent ``top_k`` reviews ordered by date DESC.
+       comparative — ``top_k // 2`` low-rated (≤ 2★) reviews +
+                     ``top_k // 2`` high-rated (≥ 4★) reviews,
+                     both ordered by similarity to the question.
+       author / search — standard similarity search with ``top_k`` results.
+
+    Parameters
+    ----------
+    question:
+        The user's natural-language question.
+    session_id:
+        The upload session UUID.
+    top_k:
+        Caller-supplied retrieval budget.
+
+    Returns
+    -------
+    dict
+        Always contains ``stats`` (dict) and ``question_type`` (dict).
+        Non-comparative types: also ``reviews`` (list[dict]).
+        Comparative type: ``positive_reviews`` and ``negative_reviews`` instead.
+        Analytical type: also ``note`` = ``"answer from stats"``.
+    """
+    question_type = classify_question(question)
+    qtype = question_type["type"]
+    logger.info(
+        "Question classified — session=%s type=%s question=%.60r",
+        session_id,
+        qtype,
+        question,
+    )
+
+    # Stats are non-fatal; all question types benefit from them in the prompt.
+    try:
+        stats = await get_session_stats(session_id)
+    except Exception:
+        logger.exception(
+            "Failed to fetch session stats — session=%s — continuing without stats",
+            session_id,
+        )
+        stats = {
+            "total_reviews": 0,
+            "reviews_with_text": 0,
+            "avg_rating": None,
+            "language_distribution": {},
+            "rating_distribution": {},
+            "date_range": None,
+        }
+
+    if qtype == "analytical":
+        reviews = await retrieve_similar_reviews(question, session_id, top_k=5)
+        return {
+            "reviews": reviews,
+            "stats": stats,
+            "question_type": question_type,
+            "note": "answer from stats",
+        }
+
+    if qtype == "temporal":
+        pool = await get_asyncpg_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    review_id::text,
+                    author,
+                    rating,
+                    date::text,
+                    text,
+                    language
+                FROM reviews
+                WHERE session_id = $1::uuid
+                  AND has_text   = TRUE
+                ORDER BY date DESC NULLS LAST
+                LIMIT $2
+                """,
+                session_id,
+                top_k,
+            )
+        reviews = [
+            {
+                "review_id": row["review_id"],
+                "author": row["author"],
+                "rating": row["rating"],
+                "date": row["date"],
+                "text": row["text"],
+                "language": row["language"],
+                "similarity": None,
+            }
+            for row in rows
+        ]
+        return {"reviews": reviews, "stats": stats, "question_type": question_type}
+
+    if qtype == "comparative":
+        from backend.services.embedding_service import embed_query  # noqa: PLC0415
+
+        query_vector = embed_query(question)
+        vector_str = "[" + ",".join(map(str, query_vector)) + "]"
+        half_k = max(1, top_k // 2)
+
+        pool = await get_asyncpg_pool()
+        async with pool.acquire() as conn:
+            neg_rows = await conn.fetch(
+                """
+                SELECT
+                    review_id::text,
+                    author,
+                    rating,
+                    date::text,
+                    text,
+                    language,
+                    1 - (embedding <=> $1::vector) AS similarity
+                FROM reviews
+                WHERE session_id = $2::uuid
+                  AND rating     <= 2
+                  AND has_text   = TRUE
+                  AND embedding  IS NOT NULL
+                ORDER BY embedding <=> $1::vector
+                LIMIT $3
+                """,
+                vector_str,
+                session_id,
+                half_k,
+            )
+            pos_rows = await conn.fetch(
+                """
+                SELECT
+                    review_id::text,
+                    author,
+                    rating,
+                    date::text,
+                    text,
+                    language,
+                    1 - (embedding <=> $1::vector) AS similarity
+                FROM reviews
+                WHERE session_id = $2::uuid
+                  AND rating     >= 4
+                  AND has_text   = TRUE
+                  AND embedding  IS NOT NULL
+                ORDER BY embedding <=> $1::vector
+                LIMIT $3
+                """,
+                vector_str,
+                session_id,
+                half_k,
+            )
+
+        def _row_to_dict(row: Any) -> dict[str, Any]:
+            return {
+                "review_id": row["review_id"],
+                "author": row["author"],
+                "rating": row["rating"],
+                "date": row["date"],
+                "text": row["text"],
+                "language": row["language"],
+                "similarity": round(float(row["similarity"]), 4),
+            }
+
+        return {
+            "positive_reviews": [_row_to_dict(r) for r in pos_rows],
+            "negative_reviews": [_row_to_dict(r) for r in neg_rows],
+            "stats": stats,
+            "question_type": question_type,
+        }
+
+    # author or search — standard similarity search
+    reviews = await retrieve_similar_reviews(question, session_id, top_k=top_k)
+    return {"reviews": reviews, "stats": stats, "question_type": question_type}
