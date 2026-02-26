@@ -1,5 +1,5 @@
 """
-Embedding service — dense vector encoding via multilingual-e5-large.
+Embedding service — dense vector encoding via paraphrase-multilingual-MiniLM-L12-v2.
 
 Design notes
 ------------
@@ -7,22 +7,22 @@ Design notes
   (``_model``) so it is loaded exactly once per process.  Subsequent calls
   to ``load_model()`` are near-instant cache hits.
 
-* ``intfloat/multilingual-e5-large`` requires instruction prefixes:
-    - Passages (documents to store): ``"passage: <text>"``
-    - Queries (user questions):      ``"query: <text>"``
-  Forgetting these prefixes degrades retrieval quality significantly.
+* ``sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`` is used
+  for v1 deployment due to its compact size (~420 MB vs ~1.1 GB for
+  multilingual-e5-large), making it suitable for Render.com free-tier RAM
+  constraints.  Unlike the E5 family, this model does NOT require instruction
+  prefixes — texts are encoded as-is.
 
 * ``normalize_embeddings=True`` L2-normalises each vector so that
-  dot-product similarity equals cosine similarity.  This matches
-  the recommendation in the E5 paper and lets pgvector use the
-  faster ``<=>`` (cosine) or ``<#>`` (negative inner product) operators.
+  dot-product similarity equals cosine similarity.  This lets pgvector use
+  the ``<=>`` (cosine) or ``<#>`` (negative inner product) operators.
 
-* ``batch_size=32`` keeps peak RAM under ~2 GB on CPU, which is safe
-  for typical Render.com or Railway instances.  Increase on GPU machines.
+* ``batch_size=32`` keeps peak RAM safe for CPU-only instances.
+  Increase on GPU machines.
 
-* Model weights (~1.1 GB) are downloaded from HuggingFace on the first
+* Model weights (~420 MB) are downloaded from HuggingFace on the first
   run and cached in ``~/.cache/huggingface/``.  Subsequent starts reuse
-  the cache and take ~10 seconds to load into memory.
+  the cache.
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Fixed output dimension for intfloat/multilingual-e5-large.
+# Fixed output dimension for paraphrase-multilingual-MiniLM-L12-v2.
 # Used as a sanity check at startup and referenced by the migration SQL.
-_EMBEDDING_DIMENSION: int = 1024
+_EMBEDDING_DIMENSION: int = 384
 
 # Safe batch size for CPU inference.  Raise to 64-128 on a GPU instance.
 _BATCH_SIZE: int = 32
@@ -72,7 +72,7 @@ def load_model() -> SentenceTransformer:
         return _model
 
     logger.info(
-        "Loading embedding model %r — first run downloads ~1.1 GB from HuggingFace.",
+        "Loading embedding model %r — first run downloads ~420 MB from HuggingFace.",
         settings.embedding_model,
     )
     _model = SentenceTransformer(settings.embedding_model)
@@ -88,8 +88,8 @@ def embed_passages(texts: list[str]) -> list[list[float]]:
     """
     Encode a list of review texts (documents to be stored and searched).
 
-    Each text is prefixed with ``"passage: "`` as required by the E5 model
-    family.  Omitting the prefix degrades retrieval quality.
+    No instruction prefixes are needed for paraphrase-multilingual-MiniLM-L12-v2
+    — texts are encoded as-is.
 
     Parameters
     ----------
@@ -100,16 +100,15 @@ def embed_passages(texts: list[str]) -> list[list[float]]:
     Returns
     -------
     list[list[float]]
-        One 1024-dimensional float vector per input text.  Vectors are
+        One 384-dimensional float vector per input text.  Vectors are
         L2-normalised so dot-product == cosine similarity.
     """
     if not texts:
         return []
 
     model = load_model()
-    prefixed = [f"passage: {t}" for t in texts]
     vectors = model.encode(
-        prefixed,
+        texts,
         batch_size=_BATCH_SIZE,
         show_progress_bar=False,
         normalize_embeddings=True,
@@ -121,8 +120,7 @@ def embed_query(text: str) -> list[float]:
     """
     Encode a single user query string.
 
-    The text is prefixed with ``"query: "`` as required by the E5 model
-    family.
+    No instruction prefix is needed for paraphrase-multilingual-MiniLM-L12-v2.
 
     Parameters
     ----------
@@ -132,11 +130,11 @@ def embed_query(text: str) -> list[float]:
     Returns
     -------
     list[float]
-        A 1024-dimensional L2-normalised float vector.
+        A 384-dimensional L2-normalised float vector.
     """
     model = load_model()
     vector = model.encode(
-        f"query: {text}",
+        text,
         show_progress_bar=False,
         normalize_embeddings=True,
     )
@@ -148,11 +146,11 @@ def get_embedding_dimension() -> int:
     Return the fixed output dimension of the configured embedding model.
 
     Used as a startup sanity check to verify that the migration SQL and
-    the live model agree on vector size (both should be 1024).
+    the live model agree on vector size (both should be 384).
 
     Returns
     -------
     int
-        ``1024`` for ``intfloat/multilingual-e5-large``.
+        ``384`` for ``paraphrase-multilingual-MiniLM-L12-v2``.
     """
     return _EMBEDDING_DIMENSION

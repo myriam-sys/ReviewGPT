@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.1-8b-instant"
 
     # ── Embeddings ────────────────────────────────────────────────────────────
-    embedding_model: str = "intfloat/multilingual-e5-large"
-    embedding_dimension: int = 1024
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    embedding_dimension: int = 384
 
     # ── App ───────────────────────────────────────────────────────────────────
     app_env: str = "development"
