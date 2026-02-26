@@ -43,7 +43,8 @@ test-results/
 
 # ── HuggingFace model cache (can be large) ─────────────────────────────────────
 .cache/
-models/
+# Only ignore root-level models cache (HuggingFace downloads)
+/models/
 
 # ── Node / Next.js ─────────────────────────────────────────────────────────────
 node_modules/
