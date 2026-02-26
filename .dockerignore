@@ -1,0 +1,15 @@
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.local
+frontend/
+.git
+.gitignore
+*.md
+.pytest_cache
+tests/
+*.test.py

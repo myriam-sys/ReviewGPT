@@ -12,6 +12,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.core.config import settings
 from backend.routers import chat, upload
 
 logger = logging.getLogger(__name__)
@@ -70,4 +71,4 @@ async def startup_event() -> None:
 @app.get("/health", tags=["health"])
 async def health_check() -> dict:
     """Liveness probe — confirms the API is running."""
-    return {"status": "ok"}
+    return {"status": "ok", "environment": settings.app_env}
