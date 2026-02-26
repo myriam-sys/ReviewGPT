@@ -172,8 +172,9 @@ async def upload_csv(
     # fails for any reason we log the error and continue.  The in-memory store
     # guarantees the preview endpoint still works for the session lifetime.
     inserted_rows = 0
+    skipped_rows = 0
     try:
-        inserted_rows = save_reviews_to_db(valid_reviews, session_id)
+        inserted_rows, skipped_rows = save_reviews_to_db(valid_reviews, session_id)
     except Exception:
         logger.exception(
             "DB write failed — session=%s reviews will only be available "
@@ -193,13 +194,14 @@ async def upload_csv(
 
     logger.info(
         "Ingestion complete — session=%s total=%d valid=%d invalid=%d "
-        "embeddable=%d inserted=%d embedding=%s",
+        "embeddable=%d inserted=%d skipped=%d embedding=%s",
         session_id,
         total_rows,
         len(valid_reviews),
         len(errors),
         reviews_with_text,
         inserted_rows,
+        skipped_rows,
         embedding_status,
     )
 
@@ -210,6 +212,7 @@ async def upload_csv(
         invalid_rows=len(errors),
         reviews_with_text=reviews_with_text,
         inserted_rows=inserted_rows,
+        skipped_rows=skipped_rows,
         embedding_status=embedding_status,
         errors=errors,
     )

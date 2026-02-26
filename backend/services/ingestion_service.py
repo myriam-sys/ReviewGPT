@@ -22,6 +22,7 @@ always receive a plain ``DataFrame`` and are completely format-agnostic.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -430,6 +431,13 @@ def validate_and_clean(
         # date_value is None when the field is missing or unparseable;
         # the row is still ingested (ReviewClean.date allows None).
 
+        # Compute a stable hash from the raw CSV values so that re-uploading
+        # the same file is idempotent.  Raw strings (not parsed values) are
+        # used so that relative-date parsing doesn't vary between runs.
+        content_hash = hashlib.md5(
+            f"{_get('author')}|{_get('rating')}|{text_value}|{_get('date')}".encode()
+        ).hexdigest()
+
         try:
             review = ReviewClean(
                 session_id=session_id,
@@ -439,6 +447,7 @@ def validate_and_clean(
                 text=text_value,  # None when blank; has_text derives from this
                 language=language_from_csv,
                 original_language_detected=language_detected,
+                content_hash=content_hash,
             )
             valid_reviews.append(review)
         except ValidationError as exc:
@@ -457,9 +466,15 @@ def validate_and_clean(
     return valid_reviews, errors
 
 
-def save_reviews_to_db(reviews: list[ReviewClean], session_id: str) -> int:
+def save_reviews_to_db(
+    reviews: list[ReviewClean], session_id: str
+) -> tuple[int, int]:
     """
-    Insert *reviews* into the Supabase ``reviews`` table in batches.
+    Upsert *reviews* into the Supabase ``reviews`` table in batches.
+
+    Uses ``ON CONFLICT (session_id, content_hash) DO NOTHING`` so that
+    re-uploading the same CSV is idempotent — duplicate rows are silently
+    skipped and existing embeddings are preserved.
 
     Rows are serialised to plain dicts before insertion — UUIDs become strings
     and datetimes become ISO 8601 strings — because the Supabase PostgREST
@@ -478,9 +493,9 @@ def save_reviews_to_db(reviews: list[ReviewClean], session_id: str) -> int:
 
     Returns
     -------
-    int
-        The total number of rows confirmed inserted by Supabase.  This may
-        differ from ``len(reviews)`` if Supabase returns partial data.
+    tuple[int, int]
+        ``(inserted, skipped)`` where *inserted* is the number of rows
+        actually written and *skipped* is the number that already existed.
 
     Raises
     ------
@@ -492,7 +507,7 @@ def save_reviews_to_db(reviews: list[ReviewClean], session_id: str) -> int:
         whether to fall back to in-memory storage.
     """
     if not reviews:
-        return 0
+        return 0, 0
 
     rows = [
         {
@@ -504,6 +519,7 @@ def save_reviews_to_db(reviews: list[ReviewClean], session_id: str) -> int:
             "text": r.text,
             "language": r.language,
             "has_text": r.has_text,
+            "content_hash": r.content_hash,
         }
         for r in reviews
     ]
@@ -514,19 +530,28 @@ def save_reviews_to_db(reviews: list[ReviewClean], session_id: str) -> int:
 
     for batch_start in range(0, len(rows), _BATCH_SIZE):
         batch = rows[batch_start : batch_start + _BATCH_SIZE]
-        result = client.table("reviews").insert(batch).execute()
+        result = (
+            client.table("reviews")
+            .upsert(batch, on_conflict="session_id,content_hash", ignore_duplicates=True)
+            .execute()
+        )
         inserted += len(result.data)
         logger.debug(
-            "Inserted batch — session=%s rows=%d cumulative=%d",
+            "Upserted batch — session=%s attempted=%d inserted=%d cumulative=%d",
             session_id,
+            len(batch),
             len(result.data),
             inserted,
         )
 
+    skipped = len(reviews) - inserted
     logger.info(
-        "DB insert complete — session=%s total_inserted=%d", session_id, inserted
+        "DB upsert complete — session=%s total_inserted=%d skipped=%d",
+        session_id,
+        inserted,
+        skipped,
     )
-    return inserted
+    return inserted, skipped
 
 
 async def compute_and_store_embeddings(session_id: str) -> int:
