@@ -27,8 +27,9 @@ var/
 sdist/
 develop-eggs/
 .installed.cfg
-lib/
-lib64/
+# Only ignore root-level lib folders (Python build artifacts)
+/lib/
+/lib64/
 .eggs/
 .pytest_cache/
 .mypy_cache/
