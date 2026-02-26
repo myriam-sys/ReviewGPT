@@ -28,8 +28,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "https://*.vercel.app",
+        "https://reviewgpt-gray.vercel.app",
+        "https://reviewgpt-myriam-sys-projects.vercel.app",
+        "https://reviewgpt-git-main-myriam-sys-projects.vercel.app",
+        "https://reviewgpt-ifrcnlwws-myriam-sys-projects.vercel.app",
     ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
