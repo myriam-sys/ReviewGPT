@@ -95,11 +95,18 @@ def build_rag_prompt(
     """
     # ── System message ────────────────────────────────────────────────────────
     total = session_stats.get("total_reviews", 0)
+    reviews_with_text = session_stats.get("reviews_with_text", 0)
     avg_rating = session_stats.get("avg_rating")
     lang_dist = session_stats.get("language_distribution", {})
+    rating_dist = session_stats.get("rating_distribution", {})
     date_range = session_stats.get("date_range")
 
     avg_str = f"{avg_rating:.2f}/5" if avg_rating is not None else "N/A"
+    rating_dist_str = (
+        ", ".join(f"{star}★: {rating_dist.get(star, 0)}" for star in range(1, 6))
+        if rating_dist
+        else "N/A"
+    )
     lang_str = (
         ", ".join(f"{lang} ({cnt})" for lang, cnt in list(lang_dist.items())[:5])
         if lang_dist
@@ -114,14 +121,19 @@ def build_rag_prompt(
     system_content = (
         "You are an expert analyst of Google Maps business reviews. "
         "You help business owners and their teams understand what customers think.\n\n"
-        f"Dataset context:\n"
-        f"- Total reviews in session: {total}\n"
+        "## Dataset Statistics (exact SQL aggregates — use these for any numerical questions)\n"
+        f"- Total reviews: {total} ({reviews_with_text} with text)\n"
         f"- Average rating: {avg_str}\n"
+        f"- Rating distribution: {rating_dist_str}\n"
         f"- Languages: {lang_str}\n"
         f"- Date range: {date_str}\n\n"
-        "Instructions:\n"
-        "- Answer ONLY based on the reviews provided below. "
-        "Do not invent, extrapolate, or recall information outside the provided text.\n"
+        "## Instructions\n"
+        "- For analytical questions (e.g. 'what is the average rating?', "
+        "'how many 5-star reviews?'), answer directly from the Dataset Statistics "
+        "above — these are exact counts from SQL.\n"
+        "- Use the retrieved reviews below for qualitative context: themes, "
+        "specific examples, and representative quotes.\n"
+        "- Answer ONLY based on the provided data. Do not invent or extrapolate.\n"
         "- When relevant, cite the reviewer's name and rating "
         "(e.g. \"According to Marie (5★)…\").\n"
         "- If no provided review is relevant to the question, say so honestly "

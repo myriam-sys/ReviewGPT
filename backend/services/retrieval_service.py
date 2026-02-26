@@ -147,7 +147,8 @@ async def get_session_stats(session_id: str) -> dict[str, Any]:
     dict
         Keys: ``total_reviews`` (int), ``reviews_with_text`` (int),
         ``avg_rating`` (float | None), ``language_distribution``
-        (dict[str, int]), ``date_range`` (dict | None with ``earliest``
+        (dict[str, int]), ``rating_distribution`` (dict[int, int] mapping
+        star 1–5 to count), ``date_range`` (dict | None with ``earliest``
         and ``latest`` ISO strings).
     """
     pool = await get_asyncpg_pool()
@@ -177,7 +178,19 @@ async def get_session_stats(session_id: str) -> dict[str, Any]:
             session_id,
         )
 
+        rating_rows = await conn.fetch(
+            """
+            SELECT ROUND(rating)::int AS star, COUNT(*)::int AS count
+            FROM reviews
+            WHERE session_id = $1::uuid
+            GROUP BY star
+            ORDER BY star
+            """,
+            session_id,
+        )
+
     language_distribution = {row["language"]: row["count"] for row in lang_rows}
+    rating_distribution = {row["star"]: row["count"] for row in rating_rows}
 
     def _iso(val: Any) -> str | None:
         if val is None:
@@ -193,5 +206,6 @@ async def get_session_stats(session_id: str) -> dict[str, Any]:
         "reviews_with_text": stats_row["reviews_with_text"] or 0,
         "avg_rating": float(stats_row["avg_rating"]) if stats_row["avg_rating"] is not None else None,
         "language_distribution": language_distribution,
+        "rating_distribution": rating_distribution,
         "date_range": date_range,
     }
