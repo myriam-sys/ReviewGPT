@@ -37,9 +37,11 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.1-8b-instant"
 
+    # ── Mistral ───────────────────────────────────────────────────────────────
+    mistral_api_key: str = ""
+
     # ── Embeddings ────────────────────────────────────────────────────────────
-    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    embedding_dimension: int = 384
+    embedding_dimension: int = 1024
 
     # ── App ───────────────────────────────────────────────────────────────────
     app_env: str = "development"

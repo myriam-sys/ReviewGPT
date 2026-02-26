@@ -14,10 +14,10 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
-      - key: EMBEDDING_MODEL
-        value: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      - key: MISTRAL_API_KEY
+        sync: false
       - key: EMBEDDING_DIMENSION
-        value: "384"
+        value: "1024"
       - key: GROQ_MODEL
         value: llama-3.1-8b-instant
       - key: APP_ENV

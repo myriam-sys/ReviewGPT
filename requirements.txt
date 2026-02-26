@@ -1,7 +1,3 @@
-# ── PyTorch index (CPU-only build — avoids ~2 GB CUDA wheels in Docker) ───────
-# pip will check this index in addition to PyPI when resolving packages.
---extra-index-url https://download.pytorch.org/whl/cpu
-
 # ── Web framework ──────────────────────────────────────────────────────────────
 fastapi==0.115.0              # Async web framework for building the REST API
 uvicorn[standard]==0.30.6     # ASGI server to run FastAPI (includes websockets + reload)
@@ -15,9 +11,7 @@ pandas==2.2.2                 # CSV parsing and tabular data manipulation
 python-multipart==0.0.9       # Required by FastAPI to handle file uploads (multipart/form-data)
 
 # ── Embeddings ─────────────────────────────────────────────────────────────────
-sentence-transformers==3.1.1  # Load and run multilingual-e5-large for text embedding
-torch==2.4.1+cpu              # CPU-only PyTorch; resolves from the extra-index-url above
-transformers==4.44.2          # HuggingFace model hub & tokenizer utilities
+mistralai>=1.0.0              # Mistral Python SDK — used for mistral-embed (1024-dim)
 
 # ── Vector database ────────────────────────────────────────────────────────────
 supabase==2.7.4               # Official Supabase Python client (REST + realtime)

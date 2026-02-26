@@ -1,36 +1,29 @@
 """
-Embedding service — dense vector encoding via paraphrase-multilingual-MiniLM-L12-v2.
+Embedding service — dense vector encoding via the Mistral Embed API.
 
 Design notes
 ------------
-* The ``SentenceTransformer`` model is held in a module-level singleton
-  (``_model``) so it is loaded exactly once per process.  Subsequent calls
-  to ``load_model()`` are near-instant cache hits.
+* Uses ``mistral-embed`` (1024-dimensional, multilingual) via Mistral's
+  REST API instead of running a local model.  This eliminates the ~420 MB
+  model download and the 512 MB RAM ceiling that blocked Render free-tier
+  deployment.
 
-* ``sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`` is used
-  for v1 deployment due to its compact size (~420 MB vs ~1.1 GB for
-  multilingual-e5-large), making it suitable for Render.com free-tier RAM
-  constraints.  Unlike the E5 family, this model does NOT require instruction
-  prefixes — texts are encoded as-is.
+* The Mistral client is held in a module-level singleton (``_client``) and
+  initialised lazily on first use.  ``load_model()`` is kept as a no-op so
+  that the FastAPI startup hook requires no changes.
 
-* ``normalize_embeddings=True`` L2-normalises each vector so that
-  dot-product similarity equals cosine similarity.  This lets pgvector use
-  the ``<=>`` (cosine) or ``<#>`` (negative inner product) operators.
+* ``mistral-embed`` outputs L2-normalised 1024-dimensional vectors, which
+  are directly compatible with pgvector's ``<=>`` (cosine) operator.
 
-* ``batch_size=32`` keeps peak RAM safe for CPU-only instances.
-  Increase on GPU machines.
-
-* Model weights (~420 MB) are downloaded from HuggingFace on the first
-  run and cached in ``~/.cache/huggingface/``.  Subsequent starts reuse
-  the cache.
+* Batch size is determined by the API (up to 512 texts per request).
+  No local batch size tuning is needed.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
-from sentence_transformers import SentenceTransformer
+from mistralai import Mistral
 
 from backend.core.config import settings
 
@@ -38,89 +31,75 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Fixed output dimension for paraphrase-multilingual-MiniLM-L12-v2.
-# Used as a sanity check at startup and referenced by the migration SQL.
-_EMBEDDING_DIMENSION: int = 384
-
-# Safe batch size for CPU inference.  Raise to 64-128 on a GPU instance.
-_BATCH_SIZE: int = 32
+# Output dimension of mistral-embed.
+# Must match the vector(N) column created by migration 004.
+_EMBEDDING_DIMENSION: int = 1024
 
 # ── Singleton ─────────────────────────────────────────────────────────────────
 
-_model: Optional[SentenceTransformer] = None
+_client: Mistral | None = None
+
+
+def _get_client() -> Mistral:
+    global _client
+    if _client is None:
+        if not settings.mistral_api_key:
+            raise RuntimeError(
+                "MISTRAL_API_KEY is not configured. "
+                "Set it in your .env file or Render environment variables."
+            )
+        _client = Mistral(api_key=settings.mistral_api_key)
+        logger.info("Mistral client initialised")
+    return _client
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def load_model() -> SentenceTransformer:
+def load_model() -> None:
     """
-    Load ``settings.embedding_model`` and cache it for the process lifetime.
+    No-op for API-based embeddings — kept for startup hook compatibility.
 
-    Intended to be called once at application startup (via the FastAPI
-    ``startup`` event) so the first upload request is not penalised by the
-    ~10-second load time.  Subsequent calls return the cached instance
-    immediately.
-
-    Returns
-    -------
-    SentenceTransformer
-        The loaded model, ready for encoding.
+    The FastAPI ``startup`` event calls this function; with a local model it
+    triggered a download.  Here it just logs a confirmation so the startup
+    logs remain informative.
     """
-    global _model
-    if _model is not None:
-        return _model
-
     logger.info(
-        "Loading embedding model %r — first run downloads ~420 MB from HuggingFace.",
-        settings.embedding_model,
-    )
-    _model = SentenceTransformer(settings.embedding_model)
-    logger.info(
-        "Embedding model loaded — dimension=%d device=%s",
+        "Embedding backend: Mistral API (mistral-embed, %d-dim). "
+        "No local model to load.",
         _EMBEDDING_DIMENSION,
-        _model.device,
     )
-    return _model
 
 
 def embed_passages(texts: list[str]) -> list[list[float]]:
     """
-    Encode a list of review texts (documents to be stored and searched).
-
-    No instruction prefixes are needed for paraphrase-multilingual-MiniLM-L12-v2
-    — texts are encoded as-is.
+    Encode a list of review texts via the Mistral Embed API.
 
     Parameters
     ----------
     texts:
-        Review bodies to embed.  Must be non-empty strings.  Empty list
-        returns an empty list without touching the model.
+        Review bodies to embed.  Empty list returns immediately without an
+        API call.
 
     Returns
     -------
     list[list[float]]
-        One 384-dimensional float vector per input text.  Vectors are
-        L2-normalised so dot-product == cosine similarity.
+        One 1024-dimensional float vector per input text.
     """
     if not texts:
         return []
 
-    model = load_model()
-    vectors = model.encode(
-        texts,
-        batch_size=_BATCH_SIZE,
-        show_progress_bar=False,
-        normalize_embeddings=True,
+    client = _get_client()
+    response = client.embeddings.create(
+        model="mistral-embed",
+        inputs=texts,
     )
-    return [v.tolist() for v in vectors]
+    return [item.embedding for item in response.data]
 
 
 def embed_query(text: str) -> list[float]:
     """
-    Encode a single user query string.
-
-    No instruction prefix is needed for paraphrase-multilingual-MiniLM-L12-v2.
+    Encode a single user query string via the Mistral Embed API.
 
     Parameters
     ----------
@@ -130,27 +109,18 @@ def embed_query(text: str) -> list[float]:
     Returns
     -------
     list[float]
-        A 384-dimensional L2-normalised float vector.
+        A 1024-dimensional float vector.
     """
-    model = load_model()
-    vector = model.encode(
-        text,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-    )
-    return vector.tolist()
+    return embed_passages([text])[0]
 
 
 def get_embedding_dimension() -> int:
     """
-    Return the fixed output dimension of the configured embedding model.
-
-    Used as a startup sanity check to verify that the migration SQL and
-    the live model agree on vector size (both should be 384).
+    Return the fixed output dimension of the embedding model.
 
     Returns
     -------
     int
-        ``384`` for ``paraphrase-multilingual-MiniLM-L12-v2``.
+        ``1024`` for ``mistral-embed``.
     """
     return _EMBEDDING_DIMENSION
