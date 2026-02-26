@@ -27,6 +27,12 @@ print('Model pre-downloaded successfully')"
 # Copy backend source code
 COPY backend/ ./backend/
 
+# Ensure Python can resolve 'backend.*' imports from /app.
+# WORKDIR is /app, so 'backend' is a direct child directory.
+# Setting PYTHONPATH makes this explicit and independent of how
+# uvicorn is invoked (avoids ModuleNotFoundError on Render).
+ENV PYTHONPATH=/app
+
 # Create non-root user for security
 RUN adduser --disabled-password --gecos '' appuser && \
     chown -R appuser /app
