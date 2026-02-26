@@ -20,6 +20,7 @@ initialised lazily on first use.
 from __future__ import annotations
 
 import logging
+import unicodedata
 from typing import Any
 
 from backend.db.supabase_client import get_asyncpg_pool
@@ -213,18 +214,37 @@ async def get_session_stats(session_id: str) -> dict[str, Any]:
 
 # ── Query classification ───────────────────────────────────────────────────────
 
+
+def _normalize(text: str) -> str:
+    """
+    Lowercase and strip accent marks from *text* for accent-insensitive matching.
+
+    Uses NFD decomposition to separate base characters from combining diacritical
+    marks, then drops the diacritics via ASCII encoding.  This means "récemment"
+    and "recemment" both normalize to "recemment", so a single keyword covers
+    both spellings.
+    """
+    return (
+        unicodedata.normalize("NFD", text.lower())
+        .encode("ascii", "ignore")
+        .decode("utf-8")
+    )
+
+
+# All keywords are stored pre-normalized (no accents, lowercase) so that
+# _normalize(question) can be compared against them directly.
 _ANALYTICAL_KEYWORDS: frozenset[str] = frozenset({
     "moyenne", "average", "combien", "how many", "pourcentage",
     "percent", "total", "distribution", "note", "rating", "score",
     "nombre", "count", "statistique", "stats",
 })
 _TEMPORAL_KEYWORDS: frozenset[str] = frozenset({
-    "évolution", "évolu", "tendance", "trend", "récent", "recent",
-    "dernièr", "latest", "avant", "before", "après", "after", "année", "year",
-    "mois", "month", "améliore", "dégrade", "over time", "changed",
+    "evolution", "evolue", "tendance", "trend", "recent", "dernier",
+    "latest", "avant", "apres", "after", "annee", "year",
+    "mois", "month", "amelior", "degrade", "over time", "changed", "progress",
 })
 _COMPARATIVE_KEYWORDS: frozenset[str] = frozenset({
-    "différence", "difference", "compar", "positif", "négatif",
+    "difference", "compar", "positif", "negatif",
     "positive", "negative", "mieux", "better", "worse", "pire",
     "versus", "vs", "contrast",
 })
@@ -254,7 +274,7 @@ def classify_question(question: str) -> dict[str, Any]:
         ``fetch_positive_negative_split`` (bool),
         ``use_stats_prominently`` (bool).
     """
-    q = question.lower()
+    q = _normalize(question)
     if any(kw in q for kw in _ANALYTICAL_KEYWORDS):
         return {
             "type": "analytical",
